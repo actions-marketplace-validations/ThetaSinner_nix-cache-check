@@ -9,7 +9,17 @@ use anyhow::anyhow;
 use crate::parser::{parse_log, CacheInfo};
 
 fn from_csv(input: &str) -> anyhow::Result<HashSet<String>> {
-    Ok(input.split(",").map(|v| v.trim().to_owned()).collect())
+    Ok(input
+        .split(",")
+        .filter_map(|v| {
+            let x = v.trim().to_owned();
+            if !x.is_empty() {
+                Some(x)
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
 pub fn run_app() -> anyhow::Result<()> {
@@ -23,24 +33,40 @@ pub fn run_app() -> anyhow::Result<()> {
 
     if let Ok(build_args) = std::env::var("EXTRA_BUILD_ARG") {
         for arg in build_args.split(" ") {
-            cmd.arg(arg);
+            if !arg.trim().is_empty() {
+                cmd.arg(arg);
+            }
         }
     }
 
     cmd.arg(std::env::var("DERIVATION")?);
 
-    let output = cmd.output().map_err(|e| {
-        anyhow!("Failed to spawn the Nix build: {:?}", e)
-    })?;
+    println!("Starting Nix build");
+    stdout().flush()?;
+
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow!("Failed to spawn the Nix build: {:?}", e))?;
+
+    println!("Finished Nix build");
+    stdout().flush()?;
 
     if !output.status.success() {
+        println!("Nix build command failed, dumping its logs");
         stdout().write_all(&output.stderr)?;
         exit(1);
     }
 
-    let stderr = output.stderr;
+    let stderr = String::from_utf8(output.stderr)?;
 
-    let cache_info = parse_log(stderr.as_slice())?;
+    let cache_info = match parse_log(stderr.as_str()) {
+        Ok(ci) => ci,
+        Err(e) => {
+            eprintln!("There was a problem parsing the input: {}", e);
+            eprintln!("The original input was: {}", stderr);
+            exit(1);
+        }
+    };
 
     println!(
         "Found [{}] to derivations build and [{}] to fetch",
@@ -50,7 +76,11 @@ pub fn run_app() -> anyhow::Result<()> {
     stdout().flush()?;
 
     if validate(
-        from_csv(std::env::var("PERMIT_BUILD_DERIVATIONS").unwrap_or_else(|_| "".to_string()).as_str())?,
+        from_csv(
+            std::env::var("PERMIT_BUILD_DERIVATIONS")
+                .unwrap_or_else(|_| "".to_string())
+                .as_str(),
+        )?,
         &cache_info,
     )? {
         println!("Validation passed!");
@@ -70,12 +100,18 @@ pub fn run_app() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn validate(permit_build_derivations: HashSet<String>, cache_info: &CacheInfo) -> anyhow::Result<bool> {
+pub fn validate(
+    permit_build_derivations: HashSet<String>,
+    cache_info: &CacheInfo,
+) -> anyhow::Result<bool> {
     let mut all_passed = true;
+
+    let mut permits_used = HashSet::new();
 
     for to_build in cache_info.get_derivations_to_build() {
         let to_build_name: String = to_build
-            .strip_suffix(".drv").ok_or(anyhow!("Not a derivation? {}", to_build))?
+            .strip_suffix(".drv")
+            .ok_or(anyhow!("Not a derivation? {}", to_build))?
             .split("-")
             .skip(1)
             .collect::<Vec<&str>>()
@@ -83,6 +119,7 @@ pub fn validate(permit_build_derivations: HashSet<String>, cache_info: &CacheInf
 
         if permit_build_derivations.contains(to_build_name.as_str()) {
             println!("Permitting [{}] to be built", to_build);
+            permits_used.insert(to_build_name);
             continue;
         }
 
@@ -91,6 +128,10 @@ pub fn validate(permit_build_derivations: HashSet<String>, cache_info: &CacheInf
             to_build
         );
         all_passed = false;
+    }
+
+    for unused in permit_build_derivations.difference(&permits_used) {
+        println!("Warning: You have marked {} as permitted to be built but it is either cached or no longer part of this derivation", unused);
     }
 
     Ok(all_passed)
